@@ -1,0 +1,17 @@
+[package]
+name = "ygo_fix"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Engine-focused DirectDraw v1 software wrapper with retour static detour"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+aspect-4x3 = []
+nearest-neighbor = []
+
+[dependencies]
+retour = { version = "=0.4.0-alpha.4", features = ["static-detour"] }
