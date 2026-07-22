@@ -1,4 +1,4 @@
-# ygo_fix_retour_v0.1
+# ygo_scaling_fix_retour_v0.1
 
 A minimal Rust DirectDraw v1 wrapper for the specific family of x86 EXE variants validated during this project.
 
@@ -45,7 +45,7 @@ cargo build --release
 Output:
 
 ```text
-target\i686-pc-windows-msvc\release\ygo_fix.dll
+target\i686-pc-windows-msvc\release\ygo_scaling_fix.dll
 ```
 
 To preserve source aspect ratio, for example 4:3 on a 16:9 monitor:
@@ -65,7 +65,7 @@ cargo build --release --features nearest-neighbor
 Add one import:
 
 ```text
-ygo_fix.dll!YgoFixInitialize
+ygo_scaling_fix.dll!YgoFixInitialize
 ```
 
 The import is enough to make the Windows loader load the DLL. `DllMain` starts a bootstrap thread that installs the detour. Calling `YgoFixInitialize` explicitly is also valid; repeated calls are safe because the hook is installed only once.
@@ -74,7 +74,7 @@ Place beside the EXE:
 
 ```text
 game.exe
-ygo_fix.dll
+ygo_scaling_fix.dll
 ```
 
 Do not place other DirectDraw wrappers beside the game during the first test, including `ddraw.dll`, dgVoodoo, or cnc-ddraw.
