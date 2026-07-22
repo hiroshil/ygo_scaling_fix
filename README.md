@@ -1,4 +1,4 @@
-# ygo_scaling_fix_retour_v0.1
+# ygo scaling fix using retour-rs v0.1
 
 A minimal Rust DirectDraw v1 wrapper for the specific family of x86 EXE variants validated during this project.
 
