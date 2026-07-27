@@ -1,4 +1,4 @@
-# ygo scaling fix using retour-rs v0.2
+# ygo scaling fix using retour-rs v0.3
 
 A minimal Rust DirectDraw v1 wrapper for the specific family of x86 EXE variants validated during this project.
 
@@ -146,7 +146,7 @@ Not fully supported:
 
 Initial architecture and implementation of the Rust DirectDraw v1 wrapper, software surfaces, GDI renderer, focus/window handling, mouse mapping, and project packaging:
 
-**OpenAI GPT-5.6 Thinking (high-reasoning mode)**
+**ChatGPT-5.6 Thinking (high-reasoning mode)**
 
 Function detouring:
 
