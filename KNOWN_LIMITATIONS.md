@@ -13,3 +13,6 @@
 - The window relay currently manages one game HWND in the process.
 - The DLL is assumed to remain loaded until process exit; explicit `FreeLibrary` teardown is not implemented.
 - GDI double buffering removes background-clear flicker, but it does not guarantee tear-free presentation.
+- The wrapper resets mapping mode and viewport origins for surface DC acquisitions; engines that intentionally rely on persistent custom DC transforms across `ReleaseDC` calls are outside the supported scope.
+
+- Windowed primary screen-coordinate translation uses an overlap heuristic for compatibility with callers that already pass local rectangles.

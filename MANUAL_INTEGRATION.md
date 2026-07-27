@@ -16,11 +16,11 @@ A dedicated call site is not required for the hook to work. The import is enough
 ## Requirements
 
 - The EXE must be PE32/x86.
-- The EXE must create DirectDraw through `CoCreateInstance(CLSID_DirectDraw, IID_IDirectDraw)`.
+- The EXE may create DirectDraw through `CoCreateInstance(CLSID_DirectDraw, IID_IDirectDraw)` or `ddraw!DirectDrawCreate`.
 - The DLL must be built for `i686-pc-windows-msvc`.
 - The DLL must be located beside the EXE or in another directory visible to the Windows loader.
 ```
 
 ## If a variant does not hook
 
-This wrapper currently intercepts only `CoCreateInstance`. If a given EXE variant creates DirectDraw through `DirectDrawCreate`, imports `ddraw.dll` directly, or initializes DirectDraw before the detour is installed, that variant will need an additional intercept path instead of a fixed-address patch.
+This wrapper intercepts both `CoCreateInstance` and the system `ddraw!DirectDrawCreate` export. Both COM creation and `ddraw!DirectDrawCreate` are detoured. `DirectDrawCreateEx` is intercepted only when it requests the v1 `IID_IDirectDraw`; newer DirectDraw interfaces are forwarded to the system implementation.

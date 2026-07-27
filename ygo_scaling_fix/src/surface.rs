@@ -14,6 +14,8 @@ const VTABLE_LEN: usize = 36;
 static PRIMARY_SURFACE: AtomicUsize = AtomicUsize::new(0);
 static ALL_SURFACES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static PRESENTER_BUFFER: Mutex<Option<PresenterBuffer>> = Mutex::new(None);
+static DC_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static PRIMARY_RECT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 struct PresenterBuffer {
     hwnd: usize,
@@ -48,6 +50,8 @@ struct Dib {
     old_bitmap: Hgdiobj,
     bits: *mut u8,
     pitch: i32,
+    info: Vec<u8>,
+    saved_dc: i32,
 }
 
 unsafe impl Send for Dib {}
@@ -220,7 +224,22 @@ unsafe fn create_dib(width: Dword, height: Dword, bpp: Dword) -> Result<Dib, Hre
         old_bitmap,
         bits: bits.cast(),
         pitch,
+        info,
+        saved_dc: 0,
     })
+}
+
+unsafe fn normalize_dc(hdc: Hdc) {
+    if hdc.is_null() {
+        return;
+    }
+    let _ = SetGraphicsMode(hdc, GM_ADVANCED);
+    let identity = Xform::default();
+    let _ = SetWorldTransform(hdc, &identity);
+    let _ = SetGraphicsMode(hdc, GM_COMPATIBLE);
+    let _ = SetMapMode(hdc, MM_TEXT);
+    let _ = SetWindowOrgEx(hdc, 0, 0, ptr::null_mut());
+    let _ = SetViewportOrgEx(hdc, 0, 0, ptr::null_mut());
 }
 
 unsafe fn query_interface(
@@ -297,6 +316,75 @@ fn clamp_rect(rect: Rect, width: Dword, height: Dword) -> Rect {
     }
 }
 
+
+fn overlap_area(rect: Rect, width: Dword, height: Dword) -> i64 {
+    let clipped = clamp_rect(rect, width, height);
+    i64::from(clipped.width().max(0)) * i64::from(clipped.height().max(0))
+}
+
+unsafe fn primary_destination_rect(
+    surface: *mut Surface,
+    rect: Rect,
+    operation: &str,
+) -> Rect {
+    if surface.is_null() || !(*surface).is_primary {
+        return rect;
+    }
+
+    let (hwnd, fullscreen) = {
+        let state = (*surface)
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.hwnd as Hwnd, state.fullscreen_requested)
+    };
+    if hwnd.is_null() || fullscreen {
+        return rect;
+    }
+
+    let mut client_origin = Point::default();
+    if ClientToScreen(hwnd, &mut client_origin) == FALSE {
+        return rect;
+    }
+
+    let translated = Rect {
+        left: rect.left.saturating_sub(client_origin.x),
+        top: rect.top.saturating_sub(client_origin.y),
+        right: rect.right.saturating_sub(client_origin.x),
+        bottom: rect.bottom.saturating_sub(client_origin.y),
+    };
+    let original_overlap = overlap_area(rect, (*surface).width, (*surface).height);
+    let translated_overlap = overlap_area(translated, (*surface).width, (*surface).height);
+
+    // IDirectDraw windowed primary surfaces use desktop coordinates. Some
+    // engines, however, already pass local coordinates when running through a
+    // wrapper. Select the interpretation that covers more of the logical
+    // primary surface, avoiding a compatibility regression for those callers.
+    if translated_overlap > original_overlap {
+        if PRIMARY_RECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 128 {
+            log::line(&format!(
+                "{} primary rect screen->local origin={},{} input={},{},{},{} output={},{},{},{} overlap={}=>{}",
+                operation,
+                client_origin.x,
+                client_origin.y,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                translated.left,
+                translated.top,
+                translated.right,
+                translated.bottom,
+                original_overlap,
+                translated_overlap
+            ));
+        }
+        translated
+    } else {
+        rect
+    }
+}
+
 unsafe fn read_native(pointer: *const u8, bytes: usize) -> u32 {
     match bytes {
         1 => *pointer as u32,
@@ -333,49 +421,98 @@ unsafe fn copy_scaled(
         return E_NOTIMPL;
     }
 
-    let dst_rect = clamp_rect(dst_rect, (*dst).width, (*dst).height);
-    let src_rect = clamp_rect(src_rect, (*src).width, (*src).height);
-    if dst_rect.width() <= 0 || dst_rect.height() <= 0 || src_rect.width() <= 0 || src_rect.height() <= 0 {
+    let dst_width = dst_rect.width();
+    let dst_height = dst_rect.height();
+    let src_width = src_rect.width();
+    let src_height = src_rect.height();
+    if dst_width <= 0 || dst_height <= 0 || src_width <= 0 || src_height <= 0 {
+        return DD_OK;
+    }
+
+    // Clip only the iteration area. Source sampling is still calculated from
+    // the original, unclipped destination rectangle. The previous code
+    // clamped destination and source independently, which rescaled a complete
+    // 800x600 frame into the small residual rectangle left after an off-screen
+    // window coordinate was clipped (for example roughly 430x440).
+    let clipped_dst = clamp_rect(dst_rect, (*dst).width, (*dst).height);
+    if clipped_dst.width() <= 0 || clipped_dst.height() <= 0 {
         return DD_OK;
     }
 
     let bytes = bytes_per_pixel((*dst).bpp);
-    if dst == src {
-        let dib = (*dst).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp_pitch = src_rect.width() as usize * bytes;
-        let mut temp = vec![0u8; temp_pitch * src_rect.height() as usize];
-        for row in 0..src_rect.height() as usize {
-            let source = dib.bits.add((src_rect.top as usize + row) * dib.pitch as usize + src_rect.left as usize * bytes);
-            ptr::copy_nonoverlapping(source, temp.as_mut_ptr().add(row * temp_pitch), temp_pitch);
-        }
-        for dy in 0..dst_rect.height() as usize {
-            let sy = dy * src_rect.height() as usize / dst_rect.height() as usize;
-            for dx in 0..dst_rect.width() as usize {
-                let sx = dx * src_rect.width() as usize / dst_rect.width() as usize;
-                let source = temp.as_ptr().add(sy * temp_pitch + sx * bytes);
-                let value = read_native(source, bytes);
-                if source_key.map(|key| value >= key.low && value <= key.high).unwrap_or(false) {
+    let snapshot = if dst == src {
+        let dib = (*src).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let size = dib.pitch as usize * (*src).height as usize;
+        let mut pixels = vec![0u8; size];
+        ptr::copy_nonoverlapping(dib.bits, pixels.as_mut_ptr(), size);
+        Some((pixels, dib.pitch))
+    } else {
+        None
+    };
+
+    let dst_dib = (*dst).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((pixels, source_pitch)) = snapshot.as_ref() {
+        for y in clipped_dst.top..clipped_dst.bottom {
+            let relative_y = i64::from(y - dst_rect.top);
+            let sy = src_rect.top
+                + ((relative_y * i64::from(src_height)) / i64::from(dst_height)) as i32;
+            if sy < 0 || sy >= (*src).height as i32 {
+                continue;
+            }
+            for x in clipped_dst.left..clipped_dst.right {
+                let relative_x = i64::from(x - dst_rect.left);
+                let sx = src_rect.left
+                    + ((relative_x * i64::from(src_width)) / i64::from(dst_width)) as i32;
+                if sx < 0 || sx >= (*src).width as i32 {
                     continue;
                 }
-                let target = dib.bits.add((dst_rect.top as usize + dy) * dib.pitch as usize + (dst_rect.left as usize + dx) * bytes);
+                let source = pixels.as_ptr().add(
+                    sy as usize * *source_pitch as usize + sx as usize * bytes,
+                );
+                let value = read_native(source, bytes);
+                if source_key
+                    .map(|key| value >= key.low && value <= key.high)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let target = dst_dib
+                    .bits
+                    .add(y as usize * dst_dib.pitch as usize + x as usize * bytes);
                 ptr::copy_nonoverlapping(source, target, bytes);
             }
         }
         return DD_OK;
     }
 
-    let dst_dib = (*dst).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let src_dib = (*src).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for dy in 0..dst_rect.height() as usize {
-        let sy = dy * src_rect.height() as usize / dst_rect.height() as usize;
-        for dx in 0..dst_rect.width() as usize {
-            let sx = dx * src_rect.width() as usize / dst_rect.width() as usize;
-            let source = src_dib.bits.add((src_rect.top as usize + sy) * src_dib.pitch as usize + (src_rect.left as usize + sx) * bytes);
-            let value = read_native(source, bytes);
-            if source_key.map(|key| value >= key.low && value <= key.high).unwrap_or(false) {
+    for y in clipped_dst.top..clipped_dst.bottom {
+        let relative_y = i64::from(y - dst_rect.top);
+        let sy = src_rect.top
+            + ((relative_y * i64::from(src_height)) / i64::from(dst_height)) as i32;
+        if sy < 0 || sy >= (*src).height as i32 {
+            continue;
+        }
+        for x in clipped_dst.left..clipped_dst.right {
+            let relative_x = i64::from(x - dst_rect.left);
+            let sx = src_rect.left
+                + ((relative_x * i64::from(src_width)) / i64::from(dst_width)) as i32;
+            if sx < 0 || sx >= (*src).width as i32 {
                 continue;
             }
-            let target = dst_dib.bits.add((dst_rect.top as usize + dy) * dst_dib.pitch as usize + (dst_rect.left as usize + dx) * bytes);
+            let source = src_dib
+                .bits
+                .add(sy as usize * src_dib.pitch as usize + sx as usize * bytes);
+            let value = read_native(source, bytes);
+            if source_key
+                .map(|key| value >= key.low && value <= key.high)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let target = dst_dib
+                .bits
+                .add(y as usize * dst_dib.pitch as usize + x as usize * bytes);
             ptr::copy_nonoverlapping(source, target, bytes);
         }
     }
@@ -452,6 +589,18 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
             bitmap,
             old_bitmap,
         });
+        log::line(&format!(
+            "presenter buffer hwnd=0x{:08X} client={}x{} source={}x{} viewport={},{} {}x{}",
+            hwnd as usize,
+            client.width(),
+            client.height(),
+            (*surface).width,
+            (*surface).height,
+            view.left,
+            view.top,
+            view.width(),
+            view.height()
+        ));
     }
 
     let Some(buffer) = presenter.as_mut() else {
@@ -459,7 +608,7 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
     };
 
     // Compose the complete frame off-screen. The old implementation cleared
-    // the real window DC to black before a slow HALFTONE StretchBlt, which
+    // the real window DC to black before a slow HALFTONE stretch operation, which
     // exposed a black intermediate frame and caused severe flicker.
     let _ = PatBlt(buffer.hdc, 0, 0, buffer.width, buffer.height, BLACKNESS);
 
@@ -475,26 +624,38 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
 
     {
         let dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = StretchBlt(
+        let copied = StretchDIBits(
             buffer.hdc,
             view.left,
             view.top,
             view.width(),
             view.height(),
-            dib.hdc,
             0,
             0,
             (*surface).width as i32,
             (*surface).height as i32,
+            dib.bits.cast(),
+            dib.info.as_ptr().cast(),
+            DIB_RGB_COLORS,
             SRCCOPY,
         );
+        if copied == 0 {
+            log::line("StretchDIBits failed while presenting primary surface");
+        }
     }
 
     if previous_mode != 0 {
         let _ = SetStretchBltMode(buffer.hdc, previous_mode);
     }
 
-    // Publish the completed frame with one device-to-device copy.
+    // Publish with a clean MM_TEXT destination DC. Legacy engines often use
+    // CS_OWNDC and leave anisotropic viewport state behind; applying our
+    // client-size coordinates through that state is what produced the
+    // approximately 430x440 image inside an 800x600 client.
+    let saved_dst = SaveDC(dst);
+    if saved_dst != 0 {
+        normalize_dc(dst);
+    }
     let _ = BitBlt(
         dst,
         0,
@@ -506,6 +667,9 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
         0,
         SRCCOPY,
     );
+    if saved_dst != 0 {
+        let _ = RestoreDC(dst, saved_dst);
+    }
 }
 
 pub unsafe fn present(surface: *mut Surface) {
@@ -572,7 +736,11 @@ unsafe extern "system" fn blt(
     effects: *mut DdBltFxPrefix,
 ) -> Hresult {
     let dst = from_this(this);
-    let target_rect = if dst_rect.is_null() { full_rect(dst) } else { *dst_rect };
+    let target_rect = if dst_rect.is_null() {
+        full_rect(dst)
+    } else {
+        primary_destination_rect(dst, *dst_rect, "Blt")
+    };
     let hr = if flags & DDBLT_COLORFILL != 0 {
         if effects.is_null() {
             E_INVALIDARG
@@ -622,12 +790,16 @@ unsafe extern "system" fn blt_fast(
     let dst = from_this(this);
     let src = from_this(source);
     let source_rect = if src_rect.is_null() { full_rect(src) } else { *src_rect };
-    let target_rect = Rect {
-        left: x as i32,
-        top: y as i32,
-        right: x as i32 + source_rect.width(),
-        bottom: y as i32 + source_rect.height(),
-    };
+    let target_rect = primary_destination_rect(
+        dst,
+        Rect {
+            left: x as i32,
+            top: y as i32,
+            right: x as i32 + source_rect.width(),
+            bottom: y as i32 + source_rect.height(),
+        },
+        "BltFast",
+    );
     let source_key = if flags & DDBLTFAST_SRCCOLORKEY != 0 {
         *(*src).color_key.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     } else {
@@ -778,7 +950,11 @@ unsafe extern "system" fn get_dc(this: *mut c_void, output: *mut Hdc) -> Hresult
         return E_POINTER;
     }
     let surface = from_this(this);
-    let dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if dib.saved_dc == 0 {
+        dib.saved_dc = SaveDC(dib.hdc);
+        normalize_dc(dib.hdc);
+    }
     *output = dib.hdc;
     DD_OK
 }
@@ -894,6 +1070,43 @@ unsafe extern "system" fn lock(
 
 unsafe extern "system" fn release_dc(this: *mut c_void, _hdc: Hdc) -> Hresult {
     let surface = from_this(this);
+    {
+        let mut dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if DC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+            let mut window_org = Point::default();
+            let mut viewport_org = Point::default();
+            let mut window_ext = Point::default();
+            let mut viewport_ext = Point::default();
+            let map_mode = GetMapMode(dib.hdc);
+            let _ = GetWindowOrgEx(dib.hdc, &mut window_org);
+            let _ = GetViewportOrgEx(dib.hdc, &mut viewport_org);
+            let _ = GetWindowExtEx(dib.hdc, &mut window_ext);
+            let _ = GetViewportExtEx(dib.hdc, &mut viewport_ext);
+            log::line(&format!(
+                "surface ReleaseDC ptr=0x{:08X} {}x{} primary={} map={} window_org={},{} viewport_org={},{} window_ext={}x{} viewport_ext={}x{}",
+                surface as usize,
+                (*surface).width,
+                (*surface).height,
+                (*surface).is_primary,
+                map_mode,
+                window_org.x,
+                window_org.y,
+                viewport_org.x,
+                viewport_org.y,
+                window_ext.x,
+                window_ext.y,
+                viewport_ext.x,
+                viewport_ext.y
+            ));
+        }
+        if dib.saved_dc != 0 {
+            let saved = dib.saved_dc;
+            dib.saved_dc = 0;
+            let _ = RestoreDC(dib.hdc, saved);
+        } else {
+            normalize_dc(dib.hdc);
+        }
+    }
     if (*surface).is_primary {
         present(surface);
     }
@@ -955,8 +1168,10 @@ unsafe fn apply_palette(surface: *mut Surface) {
             reserved: 0,
         };
     }
-    let dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = SetDIBColorTable(dib.hdc, 0, 256, colors.as_ptr());
+    let table = dib.info.as_mut_ptr().add(mem::size_of::<BitmapInfoHeader>()).cast::<RgbQuad>();
+    ptr::copy_nonoverlapping(colors.as_ptr(), table, colors.len());
 }
 
 unsafe extern "system" fn set_palette(this: *mut c_void, value: *mut c_void) -> Hresult {

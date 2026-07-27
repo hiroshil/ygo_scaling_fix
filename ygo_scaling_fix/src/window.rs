@@ -130,6 +130,7 @@ unsafe extern "system" fn wndproc(
         DefWindowProcA(hwnd, message, wparam, lparam)
     };
 
+
     if message == WM_NCDESTROY {
         surface::release_presenter(hwnd);
         if previous != 0 {
@@ -175,18 +176,22 @@ pub unsafe fn install(hwnd: Hwnd, state: &SharedState) {
 }
 
 pub unsafe fn enter_borderless(state: &SharedState) {
-    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let hwnd = state.hwnd as Hwnd;
-    if hwnd.is_null() {
-        return;
-    }
+    let (hwnd, logical_width, logical_height) = {
+        let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hwnd = state.hwnd as Hwnd;
+        if hwnd.is_null() {
+            return;
+        }
 
-    if !state.saved_window_state {
-        state.original_style = GetWindowLongA(hwnd, GWL_STYLE);
-        state.original_ex_style = GetWindowLongA(hwnd, GWL_EXSTYLE);
-        let _ = GetWindowRect(hwnd, &mut state.original_rect);
-        state.saved_window_state = true;
-    }
+        if !state.saved_window_state {
+            state.original_style = GetWindowLongA(hwnd, GWL_STYLE);
+            state.original_ex_style = GetWindowLongA(hwnd, GWL_EXSTYLE);
+            let _ = GetWindowRect(hwnd, &mut state.original_rect);
+            state.saved_window_state = true;
+        }
+
+        (hwnd, state.logical_width, state.logical_height)
+    };
 
     let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     let mut info = MonitorInfoA {
@@ -213,29 +218,56 @@ pub unsafe fn enter_borderless(state: &SharedState) {
         "borderless native monitor {}x{} logical={}x{}",
         rect.width(),
         rect.height(),
-        state.logical_width,
-        state.logical_height
+        logical_width,
+        logical_height
     ));
 }
 
 pub unsafe fn leave_borderless(state: &SharedState) {
-    let state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let hwnd = state.hwnd as Hwnd;
-    if hwnd.is_null() || !state.saved_window_state {
-        return;
-    }
+    let snapshot = {
+        let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hwnd = state.hwnd as Hwnd;
+        if hwnd.is_null() || !state.saved_window_state {
+            return;
+        }
+        let snapshot = (
+            hwnd,
+            state.original_style,
+            state.original_ex_style,
+            state.original_rect,
+        );
+        state.saved_window_state = false;
+        snapshot
+    };
 
-    let _ = SetWindowLongA(hwnd, GWL_STYLE, state.original_style);
-    let _ = SetWindowLongA(hwnd, GWL_EXSTYLE, state.original_ex_style);
-    let rect = state.original_rect;
-    let _ = SetWindowPos(
+    let (hwnd, style, ex_style, rect) = snapshot;
+    surface::release_presenter(hwnd);
+    let _ = SetWindowLongA(hwnd, GWL_STYLE, style);
+    let _ = SetWindowLongA(hwnd, GWL_EXSTYLE, ex_style);
+    let ok = SetWindowPos(
         hwnd,
         ptr::null_mut(),
         rect.left,
         rect.top,
-        rect.width(),
-        rect.height(),
+        rect.width().max(1),
+        rect.height().max(1),
         SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOSENDCHANGING,
     );
-    log::line("restored original window style and rectangle");
+
+    let mut client = Rect::default();
+    let client_size = if GetClientRect(hwnd, &mut client) != FALSE {
+        (client.width(), client.height())
+    } else {
+        (0, 0)
+    };
+    log::line(&format!(
+        "restored exact windowed rectangle outer={}x{} client={}x{} at {},{} ok={}",
+        rect.width(),
+        rect.height(),
+        client_size.0,
+        client_size.1,
+        rect.left,
+        rect.top,
+        ok
+    ));
 }

@@ -32,8 +32,8 @@ The primary surface is presented after `Unlock`, `ReleaseDC`, `Blt` to primary, 
 The renderer is pure GDI:
 
 1. compose the complete output into a persistent compatible memory DC;
-2. apply stretch or aspect-preserving scaling there;
-3. publish the finished frame to the game window with one `BitBlt`.
+2. scale directly from the DIB pixel buffer with `StretchDIBits`, bypassing any mapping transform left on the game-facing surface HDC;
+3. save and normalize the window DC, publish the finished frame with one `BitBlt`, then restore the original DC state.
 
 This keeps the implementation small, removes D3D9/OpenGL dependencies, and avoids visible intermediate black frames.
 
@@ -51,4 +51,14 @@ The default presenter uses GDI `HALFTONE`. The optional `nearest-neighbor` featu
 
 ## Flicker-free presentation
 
-The logical DirectDraw DIB is scaled into a persistent client-sized compatible bitmap selected into a memory DC. Only after the entire frame, including any letterbox bars, is complete is it copied to the window DC with one `BitBlt`. The real window DC is never cleared as a separate visible step.
+The logical DirectDraw DIB is scaled into a persistent client-sized compatible bitmap selected into a memory DC. `StretchDIBits` reads the pixel buffer directly, so custom mapping state on the HDC returned by `IDirectDrawSurface::GetDC` cannot shrink or offset the source. Only after the entire frame, including any letterbox bars, is complete is it copied to a normalized window DC with one `BitBlt`.
+
+
+## Windowed primary coordinates
+
+DirectDraw windowed primary-surface blits use desktop coordinates. Before a
+primary `Blt` or `BltFast`, the wrapper compares the logical-surface overlap of the raw
+rectangle with a rectangle translated by the HWND client origin. The translated
+form is selected only when it covers more of the logical primary, preserving
+compatibility with engine paths that already emit local coordinates. Clipping
+keeps the original source/destination mapping instead of rescaling after clamp.

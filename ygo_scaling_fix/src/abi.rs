@@ -73,18 +73,27 @@ pub const SRCCOPY: Dword = 0x00CC_0020;
 pub const BLACKNESS: Dword = 0x0000_0042;
 pub const COLORONCOLOR: i32 = 3;
 pub const HALFTONE: i32 = 4;
+pub const MM_TEXT: i32 = 1;
+pub const GM_COMPATIBLE: i32 = 1;
+pub const GM_ADVANCED: i32 = 2;
 
 pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
 pub const GWL_WNDPROC: i32 = -4;
 pub const WS_POPUP: Long = 0x8000_0000u32 as i32;
 pub const WS_VISIBLE: Long = 0x1000_0000;
+pub const SWP_NOSIZE: Uint = 0x0001;
+pub const SWP_NOMOVE: Uint = 0x0002;
+pub const SWP_NOZORDER: Uint = 0x0004;
+pub const SWP_NOACTIVATE: Uint = 0x0010;
 pub const SWP_NOSENDCHANGING: Uint = 0x0400;
 pub const SWP_FRAMECHANGED: Uint = 0x0020;
 pub const SWP_SHOWWINDOW: Uint = 0x0040;
 pub const MONITOR_DEFAULTTONEAREST: Dword = 2;
 
 pub const WM_PAINT: Uint = 0x000F;
+pub const WM_WINDOWPOSCHANGING: Uint = 0x0046;
+pub const WM_WINDOWPOSCHANGED: Uint = 0x0047;
 pub const WM_ERASEBKGND: Uint = 0x0014;
 pub const WM_NCDESTROY: Uint = 0x0082;
 pub const WM_MOUSEMOVE: Uint = 0x0200;
@@ -157,6 +166,30 @@ pub struct Point {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Xform {
+    pub e_m11: f32,
+    pub e_m12: f32,
+    pub e_m21: f32,
+    pub e_m22: f32,
+    pub e_dx: f32,
+    pub e_dy: f32,
+}
+
+impl Default for Xform {
+    fn default() -> Self {
+        Self {
+            e_m11: 1.0,
+            e_m12: 0.0,
+            e_m21: 0.0,
+            e_m22: 1.0,
+            e_dx: 0.0,
+            e_dy: 0.0,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rect {
     pub left: Long,
@@ -172,6 +205,18 @@ impl Rect {
     pub fn height(self) -> i32 {
         self.bottom.saturating_sub(self.top)
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowPos {
+    pub hwnd: Hwnd,
+    pub insert_after: Hwnd,
+    pub x: Long,
+    pub y: Long,
+    pub cx: Long,
+    pub cy: Long,
+    pub flags: Uint,
 }
 
 #[repr(C)]
@@ -324,6 +369,19 @@ pub struct RgnData {
     pub buffer: [u8; 1],
 }
 
+pub type DirectDrawCreateFn = unsafe extern "system" fn(
+    *const Guid,
+    *mut *mut c_void,
+    *mut c_void,
+) -> Hresult;
+
+pub type DirectDrawCreateExFn = unsafe extern "system" fn(
+    *const Guid,
+    *mut *mut c_void,
+    *const Guid,
+    *mut c_void,
+) -> Hresult;
+
 pub type CoCreateInstanceFn = unsafe extern "system" fn(
     *const Guid,
     *mut c_void,
@@ -359,6 +417,9 @@ extern "system" {
     pub fn DisableThreadLibraryCalls(module: Hmodule) -> Bool;
     pub fn GetModuleFileNameW(module: Hmodule, buffer: *mut u16, size: Dword) -> Dword;
     pub fn GetTickCount() -> Dword;
+    pub fn GetModuleHandleA(name: *const c_char) -> Hmodule;
+    pub fn LoadLibraryA(name: *const c_char) -> Hmodule;
+    pub fn GetProcAddress(module: Hmodule, name: *const c_char) -> *mut c_void;
     pub fn Sleep(milliseconds: Dword);
 }
 
@@ -375,6 +436,14 @@ extern "system" {
     pub fn BeginPaint(hwnd: Hwnd, paint: *mut PaintStruct) -> Hdc;
     pub fn EndPaint(hwnd: Hwnd, paint: *const PaintStruct) -> Bool;
     pub fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> Bool;
+    pub fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> Bool;
+    pub fn GetMenu(hwnd: Hwnd) -> Handle;
+    pub fn AdjustWindowRectEx(
+        rect: *mut Rect,
+        style: Dword,
+        has_menu: Bool,
+        ex_style: Dword,
+    ) -> Bool;
     pub fn GetDC(hwnd: Hwnd) -> Hdc;
     pub fn ReleaseDC(hwnd: Hwnd, hdc: Hdc) -> i32;
     pub fn GetWindowLongA(hwnd: Hwnd, index: i32) -> Long;
@@ -411,6 +480,18 @@ extern "system" {
     pub fn SelectObject(hdc: Hdc, object: Hgdiobj) -> Hgdiobj;
     pub fn DeleteObject(object: Hgdiobj) -> Bool;
     pub fn SetDIBColorTable(hdc: Hdc, start: Uint, count: Uint, colors: *const RgbQuad) -> Uint;
+    pub fn SaveDC(hdc: Hdc) -> i32;
+    pub fn RestoreDC(hdc: Hdc, saved_dc: i32) -> Bool;
+    pub fn GetMapMode(hdc: Hdc) -> i32;
+    pub fn SetGraphicsMode(hdc: Hdc, mode: i32) -> i32;
+    pub fn SetWorldTransform(hdc: Hdc, transform: *const Xform) -> Bool;
+    pub fn SetMapMode(hdc: Hdc, mode: i32) -> i32;
+    pub fn GetWindowOrgEx(hdc: Hdc, point: *mut Point) -> Bool;
+    pub fn GetViewportOrgEx(hdc: Hdc, point: *mut Point) -> Bool;
+    pub fn GetWindowExtEx(hdc: Hdc, size: *mut Point) -> Bool;
+    pub fn GetViewportExtEx(hdc: Hdc, size: *mut Point) -> Bool;
+    pub fn SetWindowOrgEx(hdc: Hdc, x: i32, y: i32, previous: *mut Point) -> Bool;
+    pub fn SetViewportOrgEx(hdc: Hdc, x: i32, y: i32, previous: *mut Point) -> Bool;
     pub fn SetStretchBltMode(hdc: Hdc, mode: i32) -> i32;
     pub fn SetBrushOrgEx(hdc: Hdc, x: i32, y: i32, previous: *mut Point) -> Bool;
     pub fn BitBlt(
@@ -424,6 +505,21 @@ extern "system" {
         src_y: i32,
         rop: Dword,
     ) -> Bool;
+    pub fn StretchDIBits(
+        dst: Hdc,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        src_x: i32,
+        src_y: i32,
+        src_width: i32,
+        src_height: i32,
+        bits: *const c_void,
+        info: *const c_void,
+        usage: Uint,
+        rop: Dword,
+    ) -> i32;
     pub fn StretchBlt(
         dst: Hdc,
         x: i32,

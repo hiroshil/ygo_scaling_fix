@@ -38,7 +38,15 @@ unsafe extern "system" fn query_interface(
         *output = this;
         return S_OK;
     }
-    log::trace("IDirectDraw::QueryInterface unsupported IID");
+    if !riid.is_null() {
+        let iid = *riid;
+        log::line(&format!(
+            "IDirectDraw::QueryInterface unsupported IID={:08X}-{:04X}-{:04X}",
+            iid.data1, iid.data2, iid.data3
+        ));
+    } else {
+        log::line("IDirectDraw::QueryInterface called with null IID");
+    }
     E_NOINTERFACE
 }
 
@@ -382,6 +390,10 @@ unsafe extern "system" fn set_cooperative_level(
     if fullscreen {
         window::enter_borderless(&(*object).state);
     } else if flags & DDSCL_NORMAL != 0 {
+        // Windowed DirectDraw primary-surface rectangles use desktop/screen
+        // coordinates. Preserve the engine's original window size here;
+        // enlarging the HWND before translating those rectangles only hides
+        // the coordinate bug by magnifying the already-clipped framebuffer.
         window::leave_borderless(&(*object).state);
     }
     log::line(&format!(

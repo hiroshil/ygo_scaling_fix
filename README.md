@@ -1,4 +1,4 @@
-# ygo scaling fix using retour-rs v0.1
+# ygo scaling fix using retour-rs v0.2
 
 A minimal Rust DirectDraw v1 wrapper for the specific family of x86 EXE variants validated during this project.
 
@@ -12,7 +12,8 @@ This is an engine-focused wrapper, not a general DirectDraw replacement.
 
 ```text
 game.exe
-  └─ ole32!CoCreateInstance(CLSID_DirectDraw, IID_IDirectDraw)
+  ├─ ole32!CoCreateInstance(CLSID_DirectDraw, IID_IDirectDraw)
+  └─ ddraw!DirectDrawCreate
        └─ retour::static_detour!
             └─ Rust IDirectDraw v1 wrapper
                  ├─ software IDirectDrawSurface v1 objects
@@ -60,6 +61,39 @@ The default presenter uses GDI `HALFTONE` scaling to reduce aliasing at non-inte
 cargo build --release --features nearest-neighbor
 ```
 
+## Windowed-mode behavior
+
+V7 does not enlarge a newly created `DDSCL_NORMAL` window. When leaving the
+wrapper's borderless mode, it restores the exact style and rectangle captured
+before fullscreen. This keeps the logical 800x600 primary surface aligned with
+the engine's original window while the primary-coordinate correction below is
+applied.
+
+## Windowed primary-coordinate fix
+
+In `DDSCL_NORMAL`, DirectDraw v1 primary-surface destination rectangles are in
+desktop/screen coordinates. The wrapper previously treated them as coordinates
+inside its logical 800x600 DIB and independently clamped the destination and
+source rectangles. A window whose client origin was near `(370,160)` therefore
+left only about `430x440` inside the 800x600 primary surface and then scaled the
+complete source frame into that residual area.
+
+V7 translates primary `Blt` and `BltFast` destination rectangles from screen to
+client coordinates when that interpretation covers more of the logical primary
+surface. It also uses coupled clipping, so clipping a destination no longer
+changes the source-to-destination scale. Windowed mode restores the exact saved
+window rectangle rather than magnifying the malformed primary surface.
+
+## DirectDraw surface DC isolation
+
+The v6 presenter no longer reads frames through the same memory DC returned to
+the game. Some engine paths leave anisotropic mapping or viewport origins on
+that persistent DC, which made a nominal 800x600 primary surface appear as an
+approximately 430x440 image. Each `GetDC` acquisition now receives a normalized
+MM_TEXT state that is restored on `ReleaseDC`, while presentation uses
+`StretchDIBits` directly from the DIB pixels. The final window DC is also saved,
+normalized and restored around the publish `BitBlt`.
+
 ## Manual EXE integration
 
 Add one import:
@@ -68,7 +102,7 @@ Add one import:
 ygo_scaling_fix.dll!YgoFixInitialize
 ```
 
-The import is enough to make the Windows loader load the DLL. `DllMain` starts a bootstrap thread that installs the detour. Calling `YgoFixInitialize` explicitly is also valid; repeated calls are safe because the hook is installed only once.
+The import is enough to make the Windows loader load the DLL. The bootstrap thread loads the system `ddraw.dll` and detours both `DirectDrawCreate` and `DirectDrawCreateEx` in addition to the COM path. `DllMain` starts a bootstrap thread that installs the detour. Calling `YgoFixInitialize` explicitly is also valid; repeated calls are safe because the hook is installed only once.
 
 Place beside the EXE:
 
