@@ -11,6 +11,16 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const VTABLE_LEN: usize = 36;
+
+// The engine occasionally submits small negative source coordinates to its
+// software blitter. Native DirectDraw allocations commonly have padding around
+// the visible surface, while a bare DIB section can start exactly on a page
+// boundary. Keep the logical surface inside a padded DIB so limited legacy
+// overreads/overwrites stay inside committed memory instead of faulting.
+const GUARD_PIXELS: usize = 64;
+const GUARD_ROWS: usize = 64;
+const MAX_SURFACE_DIMENSION: usize = 16_384;
+const MAX_SURFACE_BYTES: usize = 512 * 1024 * 1024;
 static PRIMARY_SURFACE: AtomicUsize = AtomicUsize::new(0);
 static ALL_SURFACES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static PRESENTER_BUFFER: Mutex<Option<PresenterBuffer>> = Mutex::new(None);
@@ -48,8 +58,16 @@ struct Dib {
     hdc: Hdc,
     bitmap: Hbitmap,
     old_bitmap: Hgdiobj,
+    // Base returned by CreateDIBSection for the complete padded bitmap.
+    storage_bits: *mut u8,
+    // Logical (0, 0) exposed through Lock/GetSurfaceDesc. This address remains
+    // stable for the lifetime of the Surface, including across Flip calls.
     bits: *mut u8,
     pitch: i32,
+    storage_width: i32,
+    storage_height: i32,
+    guard_x: i32,
+    guard_y: i32,
     info: Vec<u8>,
     saved_dc: i32,
 }
@@ -160,6 +178,41 @@ fn pixel_format(bpp: Dword) -> DdPixelFormat {
 
 unsafe fn create_dib(width: Dword, height: Dword, bpp: Dword) -> Result<Dib, Hresult> {
     let bpp = normalized_bpp(bpp);
+    let logical_width = width as usize;
+    let logical_height = height as usize;
+    if logical_width == 0
+        || logical_height == 0
+        || logical_width > MAX_SURFACE_DIMENSION
+        || logical_height > MAX_SURFACE_DIMENSION
+    {
+        return Err(E_INVALIDARG);
+    }
+
+    let storage_width = logical_width
+        .checked_add(GUARD_PIXELS * 2)
+        .ok_or(E_INVALIDARG)?;
+    let storage_height = logical_height
+        .checked_add(GUARD_ROWS * 2)
+        .ok_or(E_INVALIDARG)?;
+    if storage_width > i32::MAX as usize || storage_height > i32::MAX as usize {
+        return Err(E_INVALIDARG);
+    }
+
+    let row_bits = storage_width
+        .checked_mul(bpp as usize)
+        .ok_or(E_INVALIDARG)?;
+    let pitch = row_bits
+        .checked_add(31)
+        .ok_or(E_INVALIDARG)?
+        / 32
+        * 4;
+    let image_bytes = pitch
+        .checked_mul(storage_height)
+        .ok_or(E_INVALIDARG)?;
+    if pitch > i32::MAX as usize || image_bytes > MAX_SURFACE_BYTES {
+        return Err(E_INVALIDARG);
+    }
+
     let color_entries = if bpp == 8 { 256 } else if bpp == 16 { 3 } else { 0 };
     let mut info = vec![0u8; mem::size_of::<BitmapInfoHeader>() + color_entries * 4];
     let header = info.as_mut_ptr().cast::<BitmapInfoHeader>();
@@ -167,12 +220,12 @@ unsafe fn create_dib(width: Dword, height: Dword, bpp: Dword) -> Result<Dib, Hre
         header,
         BitmapInfoHeader {
             bi_size: mem::size_of::<BitmapInfoHeader>() as u32,
-            bi_width: width as i32,
-            bi_height: -(height as i32),
+            bi_width: storage_width as i32,
+            bi_height: -(storage_height as i32),
             bi_planes: 1,
             bi_bit_count: bpp as u16,
             bi_compression: if bpp == 16 { BI_BITFIELDS } else { BI_RGB },
-            bi_size_image: 0,
+            bi_size_image: image_bytes.min(u32::MAX as usize) as u32,
             bi_x_pels_per_meter: 0,
             bi_y_pels_per_meter: 0,
             bi_clr_used: if bpp == 8 { 256 } else { 0 },
@@ -202,34 +255,52 @@ unsafe fn create_dib(width: Dword, height: Dword, bpp: Dword) -> Result<Dib, Hre
     if hdc.is_null() {
         return Err(E_FAIL);
     }
-    let mut bits: *mut c_void = ptr::null_mut();
+    let mut storage_bits: *mut c_void = ptr::null_mut();
     let bitmap = CreateDIBSection(
         ptr::null_mut(),
         info.as_ptr().cast(),
         DIB_RGB_COLORS,
-        &mut bits,
+        &mut storage_bits,
         ptr::null_mut(),
         0,
     );
-    if bitmap.is_null() || bits.is_null() {
+    if bitmap.is_null() || storage_bits.is_null() {
         let _ = DeleteDC(hdc);
         return Err(E_FAIL);
     }
     let old_bitmap = SelectObject(hdc, bitmap.cast());
-    let pitch = (((width as usize * bpp as usize) + 31) / 32 * 4) as i32;
-    ptr::write_bytes(bits.cast::<u8>(), 0, pitch as usize * height as usize);
+    if old_bitmap.is_null() || old_bitmap as isize == -1 {
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(hdc);
+        return Err(E_FAIL);
+    }
+
+    let storage_bits = storage_bits.cast::<u8>();
+    ptr::write_bytes(storage_bits, 0, image_bytes);
+    let bytes = bytes_per_pixel(bpp);
+    let logical_offset = GUARD_ROWS
+        .checked_mul(pitch)
+        .and_then(|value| value.checked_add(GUARD_PIXELS * bytes))
+        .ok_or(E_INVALIDARG)?;
+    let bits = storage_bits.add(logical_offset);
+
     Ok(Dib {
         hdc,
         bitmap,
         old_bitmap,
-        bits: bits.cast(),
-        pitch,
+        storage_bits,
+        bits,
+        pitch: pitch as i32,
+        storage_width: storage_width as i32,
+        storage_height: storage_height as i32,
+        guard_x: GUARD_PIXELS as i32,
+        guard_y: GUARD_ROWS as i32,
         info,
         saved_dc: 0,
     })
 }
 
-unsafe fn normalize_dc(hdc: Hdc) {
+unsafe fn normalize_dc(hdc: Hdc, viewport_x: i32, viewport_y: i32) {
     if hdc.is_null() {
         return;
     }
@@ -239,7 +310,7 @@ unsafe fn normalize_dc(hdc: Hdc) {
     let _ = SetGraphicsMode(hdc, GM_COMPATIBLE);
     let _ = SetMapMode(hdc, MM_TEXT);
     let _ = SetWindowOrgEx(hdc, 0, 0, ptr::null_mut());
-    let _ = SetViewportOrgEx(hdc, 0, 0, ptr::null_mut());
+    let _ = SetViewportOrgEx(hdc, viewport_x, viewport_y, ptr::null_mut());
 }
 
 unsafe fn query_interface(
@@ -630,11 +701,11 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
             view.top,
             view.width(),
             view.height(),
-            0,
-            0,
+            dib.guard_x,
+            dib.guard_y,
             (*surface).width as i32,
             (*surface).height as i32,
-            dib.bits.cast(),
+            dib.storage_bits.cast(),
             dib.info.as_ptr().cast(),
             DIB_RGB_COLORS,
             SRCCOPY,
@@ -654,7 +725,7 @@ pub unsafe fn present_to_dc(surface: *mut Surface, hwnd: Hwnd, dst: Hdc) {
     // approximately 430x440 image inside an 800x600 client.
     let saved_dst = SaveDC(dst);
     if saved_dst != 0 {
-        normalize_dc(dst);
+        normalize_dc(dst, 0, 0);
     }
     let _ = BitBlt(
         dst,
@@ -873,9 +944,22 @@ unsafe extern "system" fn flip(
     if (*primary).width != (*back).width || (*primary).height != (*back).height || (*primary).bpp != (*back).bpp {
         return E_INVALIDARG;
     }
-    let mut front_dib = (*primary).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut back_dib = (*back).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    mem::swap(&mut *front_dib, &mut *back_dib);
+    let front_dib = (*primary).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let back_dib = (*back).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if front_dib.pitch != back_dib.pitch
+        || front_dib.storage_width != back_dib.storage_width
+        || front_dib.storage_height != back_dib.storage_height
+    {
+        return E_INVALIDARG;
+    }
+
+    // Never exchange Dib/HDC objects. GetSurfaceDesc and Lock expose pointers
+    // that legacy engines may cache beyond one call. Swapping the backing Dib
+    // changed those addresses after every Flip and also paired ReleaseDC with
+    // the wrong HDC. Exchange only the pixel contents so object identity,
+    // lpSurface and HDC stay stable.
+    let byte_count = front_dib.pitch as usize * front_dib.storage_height as usize;
+    ptr::swap_nonoverlapping(front_dib.storage_bits, back_dib.storage_bits, byte_count);
     drop(back_dib);
     drop(front_dib);
     present(primary);
@@ -953,7 +1037,7 @@ unsafe extern "system" fn get_dc(this: *mut c_void, output: *mut Hdc) -> Hresult
     let mut dib = (*surface).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if dib.saved_dc == 0 {
         dib.saved_dc = SaveDC(dib.hdc);
-        normalize_dc(dib.hdc);
+        normalize_dc(dib.hdc, dib.guard_x, dib.guard_y);
     }
     *output = dib.hdc;
     DD_OK
@@ -1104,7 +1188,7 @@ unsafe extern "system" fn release_dc(this: *mut c_void, _hdc: Hdc) -> Hresult {
             dib.saved_dc = 0;
             let _ = RestoreDC(dib.hdc, saved);
         } else {
-            normalize_dc(dib.hdc);
+            normalize_dc(dib.hdc, dib.guard_x, dib.guard_y);
         }
     }
     if (*surface).is_primary {
@@ -1308,10 +1392,23 @@ pub unsafe fn create(
     if is_primary {
         PRIMARY_SURFACE.store(pointer as usize, Ordering::Release);
     }
-    log::trace(&format!(
-        "surface create ptr=0x{:08X} {}x{}x{} caps=0x{:08X} primary={}",
-        pointer as usize, width, height, bpp, caps, is_primary
-    ));
+    {
+        let dib = (*pointer).dib.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        log::trace(&format!(
+            "surface create ptr=0x{:08X} logical={}x{}x{} pitch={} storage={}x{} guard={}x{} caps=0x{:08X} primary={}",
+            pointer as usize,
+            width,
+            height,
+            bpp,
+            dib.pitch,
+            dib.storage_width,
+            dib.storage_height,
+            dib.guard_x,
+            dib.guard_y,
+            caps,
+            is_primary
+        ));
+    }
     Ok(pointer.cast())
 }
 
